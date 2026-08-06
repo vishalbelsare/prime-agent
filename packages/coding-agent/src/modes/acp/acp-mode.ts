@@ -10,10 +10,10 @@ import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import { InProcessAgentConnection } from "../agent-connection/in-process-agent-connection.js";
-import type { AgentConnection } from "../agent-connection/types.js";
+import type { AgentConnection, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import { latestAutonomousGateAttempt } from "../headless-completion.js";
 import { type AcpEventMappingState, acpUpdatesForSessionEvent } from "./acp-events.js";
-import { primeAgentMeta } from "./acp-meta.js";
+import { type PrimeAgentAutonomousMeta, primeAgentMeta } from "./acp-meta.js";
 import { type AcpStopReason, acpStopReason } from "./acp-stop-reason.js";
 
 /**
@@ -100,6 +100,7 @@ interface AcpSessionEntry {
 	id: string;
 	abort: AbortController | undefined;
 	unsubscribe: (() => void) | undefined;
+	children: Map<string, AgentConnectionRlmChildAgentSnapshot>;
 }
 
 /**
@@ -137,18 +138,32 @@ function promptContent(blocks: readonly unknown[]): { text: string; images: Imag
 	return { text: texts.join("\n"), images };
 }
 
-function autonomousMeta(status: AgentAutonomousStatus | undefined): Record<string, unknown> | undefined {
+function autonomousMeta(status: AgentAutonomousStatus | undefined): PrimeAgentAutonomousMeta | undefined {
 	if (!status?.enabled) return undefined;
-	return primeAgentMeta({
-		autonomous: {
-			enabled: status.enabled,
-			continuationsUsed: status.continuationsUsed,
-			turnsUsed: status.turnsUsed,
-			tokensUsed: status.tokensUsed,
-			gateAttempt: latestAutonomousGateAttempt(status) || undefined,
-			gateFailure: status.lastGateFailure?.exitText,
-		},
-	});
+	return {
+		enabled: status.enabled,
+		continuationsUsed: status.continuationsUsed,
+		turnsUsed: status.turnsUsed,
+		tokensUsed: status.tokensUsed,
+		gateAttempt: latestAutonomousGateAttempt(status) || undefined,
+		gateFailure: status.lastGateFailure?.exitText,
+	};
+}
+
+function outstandingSubagentCount(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): number {
+	return (children ?? []).filter((child) => child.status === "queued" || child.status === "running").length;
+}
+
+function quiescenceMeta(
+	status: AgentAutonomousStatus,
+	children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined,
+): { outstandingSubagents: number; remainingAutonomousContinuations: number } {
+	return {
+		outstandingSubagents: outstandingSubagentCount(children),
+		remainingAutonomousContinuations: status.enabled
+			? Math.max(0, status.limits.maxContinuations - status.continuationsUsed)
+			: 0,
+	};
 }
 
 /**
@@ -298,7 +313,9 @@ export async function runAcpModeWithConnection(
 				}
 			}
 			const sessionId = randomUUID();
-			const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined };
+			const initialSnapshot = await connection.getInitialSnapshot().catch(() => undefined);
+			const children = new Map((initialSnapshot?.children ?? []).map((child) => [child.id, child]));
+			const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined, children };
 			// Subscribe for the session lifetime, not per prompt turn: prime-agent
 			// subagents are fire-and-forget and keep reporting after the spawning turn
 			// ends, so a turn-scoped subscription would drop their updates. One
@@ -316,6 +333,7 @@ export async function runAcpModeWithConnection(
 					return;
 				}
 				if (event.type !== "session_event") return;
+				if (event.event.type === "rlm_child_update") children.set(event.event.child.id, event.event.child);
 				for (const update of acpUpdatesForSessionEvent(event.event, mappingState)) {
 					notify(update);
 				}
@@ -353,15 +371,20 @@ export async function runAcpModeWithConnection(
 				// Autonomous gates continue inside this same prompt turn: the turn is
 				// only over once the gate loop settles.
 				const status = await connection.waitForHeadlessCompletion();
-				const meta = autonomousMeta(status);
-				if (meta) {
-					await ctx.client
-						.notify(acp.methods.client.session.update, {
-							sessionId: params.sessionId,
-							update: { sessionUpdate: "session_info_update", _meta: meta },
-						})
-						.catch(() => undefined);
-				}
+				// Snapshot after headless completion: detached subagents can publish a
+				// terminal update after the parent model turn has gone idle.
+				const autonomous = autonomousMeta(status);
+				const meta = primeAgentMeta({
+					...(autonomous ? { autonomous } : {}),
+					quiescence: quiescenceMeta(status, [...entry.children.values()]),
+				});
+				await ctx.client
+					.notify(acp.methods.client.session.update, {
+						sessionId: params.sessionId,
+						update: { sessionUpdate: "session_info_update", _meta: meta },
+					})
+					.catch(() => undefined);
+
 				// A turn that failed (provider error, auth, no usable model) must not be
 				// reported as a clean end_turn. Print mode surfaces
 				// `stopReason: "error"` with its errorMessage; ACP previously dropped

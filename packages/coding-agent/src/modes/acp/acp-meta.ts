@@ -59,6 +59,13 @@ export interface PrimeAgentRefinementMeta {
 	error?: string;
 }
 
+export interface PrimeAgentQuiescenceMeta {
+	/** Subagents that have not reached a terminal state at the observation point. */
+	outstandingSubagents: number;
+	/** Autonomous continuation slots still available at the observation point. */
+	remainingAutonomousContinuations: number;
+}
+
 export interface PrimeAgentAgentMessageMeta {
 	toolCallId: string;
 	target?: string;
@@ -86,6 +93,7 @@ export interface PrimeAgentSessionMeta {
 	compaction?: { tokensBefore?: number; summary?: string };
 	subagents?: PrimeAgentSubagentMeta[];
 	autonomous?: PrimeAgentAutonomousMeta;
+	quiescence?: PrimeAgentQuiescenceMeta;
 	ipython?: PrimeAgentIpythonMeta;
 }
 

@@ -84,4 +84,23 @@ describe("ACP mode end to end", () => {
 
 		harness.cleanup();
 	}, 30_000);
+
+	it("emits score-safe quiescence metadata with outstanding work and budget", async () => {
+		const harness = await createHarness();
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		const { client, updates } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: harness.tempDir, mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "finish" }],
+		});
+		const quiescence = updates.find((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
+		expect(quiescence?.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence).toEqual({
+			outstandingSubagents: 0,
+			remainingAutonomousContinuations: 0,
+		});
+		harness.cleanup();
+	}, 30_000);
 });
