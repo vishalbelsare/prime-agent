@@ -173,6 +173,32 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("propagates a failed roster read at quiescence emission", async () => {
+		// A snapshot failure while emitting must not degrade to outstandingSubagents: 0.
+		// Reporting a fabricated zero is the false-quiescent answer this metadata
+		// exists to prevent: a consumer would score a turn whose children still run.
+		const connection = fakeAcpConnection({
+			// `initialSnapshot` serves session/new and is then consumed; `finalSnapshot`
+			// serves the emission-time read, which is the one under test here.
+			initialSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
+			finalSnapshot: async () => {
+				throw new Error("roster unavailable");
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await expect(
+			client.request("session/prompt", {
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "finish" }],
+			}),
+		).rejects.toThrow();
+		const quiescence = updates.find((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
+		expect(quiescence).toBeUndefined();
+		close();
+	});
+
 	it("counts the authoritative live roster at quiescence emission", async () => {
 		const child = { id: "child-1", label: "child", status: "running", sessionDir: "/tmp/child" };
 		const connection = fakeAcpConnection({
