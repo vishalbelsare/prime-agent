@@ -29,6 +29,50 @@ interface ClientHarness {
 	close: () => void;
 }
 
+function fakeAcpConnection(
+	options: {
+		initialSnapshot?: () => Promise<any>;
+		finalSnapshot?: () => Promise<any>;
+		onInitialSnapshot?: (subscribed: boolean) => void;
+	} = {},
+): any {
+	let listener: ((event: any) => void) | undefined;
+	let subscribed = false;
+	const snapshot = { state: { cwd: process.cwd() }, messages: [] };
+	return {
+		subscribe(callback: (event: any) => void) {
+			subscribed = true;
+			listener = callback;
+			return () => {
+				listener = undefined;
+			};
+		},
+		getState: async () => snapshot.state,
+		getMessages: async () => [],
+		getInitialSnapshot: async () => {
+			if (options.onInitialSnapshot) options.onInitialSnapshot(subscribed);
+			if (options.initialSnapshot) {
+				const result = await options.initialSnapshot();
+				options.initialSnapshot = undefined;
+				return result;
+			}
+			if (options.finalSnapshot) return options.finalSnapshot();
+			return snapshot;
+		},
+		promptAndWait: async () => {},
+		waitForHeadlessCompletion: async () => ({
+			enabled: false,
+			continuationsUsed: 0,
+			turnsUsed: 0,
+			tokensUsed: 0,
+			limits: { maxContinuations: 0 },
+		}),
+		emitChild(child: any) {
+			listener?.({ type: "session_event", event: { type: "rlm_child_update", child } });
+		},
+	};
+}
+
 function connectAcpClient(connection: any): ClientHarness {
 	// Two web streams crossed over: agent's stdout is the client's stdin.
 	const toAgent = new TransformStream<Uint8Array, Uint8Array>();
@@ -103,4 +147,47 @@ describe("ACP mode end to end", () => {
 		});
 		harness.cleanup();
 	}, 30_000);
+	it("fails session creation when the initial roster snapshot fails", async () => {
+		const connection = fakeAcpConnection({
+			initialSnapshot: async () => {
+				throw new Error("snapshot unavailable");
+			},
+		});
+		const { client, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		await expect(client.request("session/new", { cwd: process.cwd(), mcpServers: [] })).rejects.toThrow();
+		close();
+	});
+
+	it("subscribes before taking the initial roster snapshot", async () => {
+		let subscribedAtSnapshot: boolean | undefined;
+		const connection = fakeAcpConnection({
+			onInitialSnapshot: (subscribed) => {
+				subscribedAtSnapshot = subscribed;
+			},
+		});
+		const { client, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		expect(subscribedAtSnapshot).toBe(true);
+		close();
+	});
+
+	it("counts the authoritative live roster at quiescence emission", async () => {
+		const child = { id: "child-1", label: "child", status: "running", sessionDir: "/tmp/child" };
+		const connection = fakeAcpConnection({
+			initialSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
+			finalSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [child] }),
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "finish" }],
+		});
+		const quiescence = updates.find((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
+		expect(quiescence.update._meta[PRIME_AGENT_META_NAMESPACE].quiescence.outstandingSubagents).toBe(1);
+		close();
+	});
 });

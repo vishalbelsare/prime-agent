@@ -100,7 +100,6 @@ interface AcpSessionEntry {
 	id: string;
 	abort: AbortController | undefined;
 	unsubscribe: (() => void) | undefined;
-	children: Map<string, AgentConnectionRlmChildAgentSnapshot>;
 }
 
 /**
@@ -313,9 +312,10 @@ export async function runAcpModeWithConnection(
 				}
 			}
 			const sessionId = randomUUID();
-			const initialSnapshot = await connection.getInitialSnapshot().catch(() => undefined);
-			const children = new Map((initialSnapshot?.children ?? []).map((child) => [child.id, child]));
-			const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined, children };
+			// Install the listener before fetching the snapshot. Child updates can arrive
+			// while the snapshot request is in flight; the connection remains the
+			// authoritative source used when quiescence is emitted below.
+			const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined };
 			// Subscribe for the session lifetime, not per prompt turn: prime-agent
 			// subagents are fire-and-forget and keep reporting after the spawning turn
 			// ends, so a turn-scoped subscription would drop their updates. One
@@ -333,13 +333,15 @@ export async function runAcpModeWithConnection(
 					return;
 				}
 				if (event.type !== "session_event") return;
-				if (event.event.type === "rlm_child_update") children.set(event.event.child.id, event.event.child);
 				for (const update of acpUpdatesForSessionEvent(event.event, mappingState)) {
 					notify(update);
 				}
 			});
-			// Claim the single-session slot only once the subscription exists, so a
-			// failed subscribe cannot leave the slot occupied and unusable.
+			// Reconcile after subscribing so updates cannot be lost while the snapshot
+			// request is in flight. Do not turn a failed read into an empty roster.
+			await connection.getInitialSnapshot();
+			// Claim the single-session slot only once the subscription and snapshot are
+			// ready, so a failed setup cannot leave it occupied and unusable.
 			entry.unsubscribe = unsubscribe;
 			session = entry;
 			return {
@@ -374,9 +376,12 @@ export async function runAcpModeWithConnection(
 				// Snapshot after headless completion: detached subagents can publish a
 				// terminal update after the parent model turn has gone idle.
 				const autonomous = autonomousMeta(status);
+				// Read the authoritative live roster at emission time. A session-local
+				// shadow map can miss detached children or updates during the turn.
+				const liveSnapshot = await connection.getInitialSnapshot();
 				const meta = primeAgentMeta({
 					...(autonomous ? { autonomous } : {}),
-					quiescence: quiescenceMeta(status, [...entry.children.values()]),
+					quiescence: quiescenceMeta(status, liveSnapshot.children),
 				});
 				await ctx.client
 					.notify(acp.methods.client.session.update, {
